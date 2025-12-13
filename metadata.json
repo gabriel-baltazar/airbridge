@@ -1,0 +1,7 @@
+{
+  "name": "AirBridge",
+  "description": "Transferência de arquivos ultra-rápida entre dispositivos (iOS, Android, Web). Seguro, sem limites e com design futurista.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
