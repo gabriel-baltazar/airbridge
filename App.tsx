@@ -1,125 +1,209 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { AppMode, TransferStatus, FileMeta, Peer } from './types';
-import { generateSessionName, analyzeFileContent } from './services/geminiService';
-import { SendIcon, DownloadIcon, FileIcon, SmartphoneIcon, LaptopIcon, CheckIcon, XIcon, RadarIcon } from './components/Icons';
+import { Peer, DataConnection } from 'peerjs';
+import { AppMode, TransferStatus, FileMeta, DataPacket } from './types';
+import { SendIcon, DownloadIcon, FileIcon, SmartphoneIcon, CheckIcon, RadarIcon, XIcon } from './components/Icons';
 import { Button } from './components/Button';
 import { RadarScan } from './components/RadarScan';
+
+// Tamanho do pedaço do arquivo (64KB para estabilidade)
+const CHUNK_SIZE = 64 * 1024;
 
 function App() {
   const [mode, setMode] = useState<AppMode>(AppMode.HOME);
   const [status, setStatus] = useState<TransferStatus>(TransferStatus.IDLE);
+  
+  // Meus dados
+  const [myPeerId, setMyPeerId] = useState<string>('');
+  const [targetId, setTargetId] = useState<string>('');
+  
+  // Transferência
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [fileMeta, setFileMeta] = useState<FileMeta | null>(null);
-  const [sessionName, setSessionName] = useState<string>('');
-  const [peers, setPeers] = useState<Peer[]>([]);
   const [progress, setProgress] = useState(0);
-  const [connectedPeer, setConnectedPeer] = useState<Peer | null>(null);
+  const [fileMeta, setFileMeta] = useState<FileMeta | null>(null);
+  const [receivedChunks, setReceivedChunks] = useState<ArrayBuffer[]>([]);
+  const [receivedSize, setReceivedSize] = useState(0);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
 
-  // Reset state when changing modes
+  // Refs para manter persistência durante callbacks
+  const peerRef = useRef<Peer | null>(null);
+  const connRef = useRef<DataConnection | null>(null);
+  const chunksRef = useRef<ArrayBuffer[]>([]); // Ref para chunks recebidos (performance)
+
+  // Limpeza ao desmontar ou trocar de modo
+  useEffect(() => {
+    return () => {
+      destroyConnection();
+    };
+  }, []);
+
+  const destroyConnection = () => {
+    if (connRef.current) {
+      connRef.current.close();
+      connRef.current = null;
+    }
+    if (peerRef.current) {
+      peerRef.current.destroy();
+      peerRef.current = null;
+    }
+    setMyPeerId('');
+    setProgress(0);
+    setReceivedChunks([]);
+    setReceivedSize(0);
+    chunksRef.current = [];
+    setDownloadUrl(null);
+  };
+
   const switchMode = (newMode: AppMode) => {
+    destroyConnection();
     setMode(newMode);
     setStatus(TransferStatus.IDLE);
-    setProgress(0);
-    setPeers([]);
-    setConnectedPeer(null);
-    if (newMode === AppMode.HOME) {
-      setSelectedFile(null);
-      setFileMeta(null);
-    }
-  };
-
-  // Handle File Selection
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const file = e.target.files[0];
-      setSelectedFile(file);
-      setStatus(TransferStatus.SCANNING);
-
-      // Analyze file with Gemini
-      const summary = await analyzeFileContent(file.name, file.type);
-      
-      setFileMeta({
-        id: Math.random().toString(36).substring(7),
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined,
-        aiSummary: summary
-      });
-
-      // Generate a session name for fun
-      const name = await generateSessionName();
-      setSessionName(name);
-
-      // Simulate Scanning for Peers
-      startMockScanning();
-    }
-  };
-
-  // Mock Discovery Mechanism
-  const startMockScanning = () => {
-    setTimeout(() => {
-      setPeers([
-        { id: '1', name: 'iPhone de Maria', device: 'mobile', status: 'available' },
-        { id: '2', name: 'MacBook Pro', device: 'desktop', status: 'available' },
-        { id: '3', name: 'Galaxy S23', device: 'mobile', status: 'busy' }
-      ]);
-    }, 2500);
-  };
-
-  // Start Transfer
-  const connectToPeer = (peer: Peer) => {
-    setConnectedPeer(peer);
-    setStatus(TransferStatus.CONNECTING);
     
-    // Simulate handshake
-    setTimeout(() => {
-      setStatus(TransferStatus.TRANSFERRING);
-      simulateTransfer();
-    }, 1500);
+    if (newMode === AppMode.RECEIVER) {
+      initializeReceiver();
+    } else if (newMode === AppMode.SENDER) {
+      initializeSender();
+    }
   };
 
-  // Simulate Transfer Progress
-  const simulateTransfer = () => {
-    let currentProgress = 0;
-    const interval = setInterval(() => {
-      currentProgress += Math.random() * 15; // Random speed
-      if (currentProgress >= 100) {
-        currentProgress = 100;
-        clearInterval(interval);
+  // --- Lógica do PeerJS ---
+
+  const generateShortId = () => {
+    // Gera ID aleatório de 6 caracteres
+    return Math.random().toString(36).substring(2, 8).toUpperCase();
+  };
+
+  const initializeReceiver = () => {
+    setStatus(TransferStatus.WAITING_FOR_ID);
+    
+    const id = generateShortId();
+    // Usamos o servidor público gratuito do PeerJS
+    const peer = new Peer(id);
+
+    peer.on('open', (id) => {
+      setMyPeerId(id);
+      setStatus(TransferStatus.WAITING_FOR_CONNECTION);
+    });
+
+    peer.on('connection', (conn) => {
+      connRef.current = conn;
+      setStatus(TransferStatus.CONNECTING);
+
+      conn.on('data', (data) => handleIncomingData(data as DataPacket));
+      
+      conn.on('close', () => {
+        // Se fechar mas não tiver completado
+        if (status !== TransferStatus.COMPLETED) {
+           alert('Conexão perdida.');
+           setStatus(TransferStatus.WAITING_FOR_CONNECTION);
+        }
+      });
+    });
+
+    peer.on('error', (err) => {
+      console.error(err);
+      alert('Erro na conexão: ' + err.type);
+    });
+
+    peerRef.current = peer;
+  };
+
+  const initializeSender = () => {
+    // Sender cria um peer com ID aleatório do sistema
+    const peer = new Peer();
+    peer.on('open', (id) => {
+      setMyPeerId(id);
+    });
+    peerRef.current = peer;
+  };
+
+  const connectToReceiver = () => {
+    if (!peerRef.current || !targetId) return;
+    
+    setStatus(TransferStatus.CONNECTING);
+    const conn = peerRef.current.connect(targetId.toUpperCase());
+
+    conn.on('open', () => {
+      connRef.current = conn;
+      if (selectedFile) {
+        sendFile(selectedFile);
+      }
+    });
+
+    conn.on('error', (err) => {
+      alert('Erro ao conectar com destinatário. Verifique o ID.');
+      setStatus(TransferStatus.IDLE);
+    });
+  };
+
+  // --- Lógica de Transferência de Dados ---
+
+  const sendFile = async (file: File) => {
+    if (!connRef.current) return;
+    setStatus(TransferStatus.TRANSFERRING);
+    
+    // 1. Enviar Header
+    const meta: FileMeta = { name: file.name, size: file.size, type: file.type };
+    connRef.current.send({ type: 'header', meta });
+
+    // 2. Enviar Chunks
+    let offset = 0;
+    const reader = new FileReader();
+
+    const readNextChunk = () => {
+      const slice = file.slice(offset, offset + CHUNK_SIZE);
+      reader.readAsArrayBuffer(slice);
+    };
+
+    reader.onload = (e) => {
+      if (!connRef.current) return;
+      
+      const buffer = e.target?.result as ArrayBuffer;
+      connRef.current.send({ type: 'chunk', data: buffer });
+      
+      offset += buffer.byteLength;
+      setProgress(Math.round((offset / file.size) * 100));
+
+      if (offset < file.size) {
+        // Pequeno delay para não engasgar a thread da UI e o buffer do WebRTC
+        setTimeout(readNextChunk, 5); 
+      } else {
+        connRef.current.send({ type: 'end' });
         setStatus(TransferStatus.COMPLETED);
       }
-      setProgress(Math.floor(currentProgress));
-    }, 300);
+    };
+
+    readNextChunk();
   };
 
-  // Receiver Flow simulation
-  const startReceiver = async () => {
-    switchMode(AppMode.RECEIVER);
-    setStatus(TransferStatus.SCANNING);
-    const name = await generateSessionName();
-    setSessionName(name);
-    
-    // Simulate an incoming request after a delay
-    setTimeout(() => {
-        setConnectedPeer({ id: 'sender-1', name: 'iPad de João', device: 'tablet', status: 'available' });
-        setFileMeta({
-            id: 'mock-file',
-            name: 'Projeto_Final_2024.pdf',
-            size: 1024 * 1024 * 5.2, // 5.2 MB
-            type: 'application/pdf',
-            aiSummary: 'Documento Acadêmico Importante'
-        });
-        setStatus(TransferStatus.CONNECTING); // "Incoming request" state
-    }, 4000);
-  };
-
-  const acceptTransfer = () => {
+  const handleIncomingData = (packet: DataPacket) => {
+    if (packet.type === 'header') {
+      setFileMeta(packet.meta);
       setStatus(TransferStatus.TRANSFERRING);
-      simulateTransfer();
+      setReceivedSize(0);
+      chunksRef.current = [];
+      setProgress(0);
+    } 
+    else if (packet.type === 'chunk') {
+      chunksRef.current.push(packet.data);
+      
+      // Atualizar progresso visual
+      setReceivedSize(prev => {
+        const newSize = prev + packet.data.byteLength;
+        if (fileMeta) {
+            setProgress(Math.round((newSize / fileMeta.size) * 100));
+        }
+        return newSize;
+      });
+    } 
+    else if (packet.type === 'end') {
+      setStatus(TransferStatus.COMPLETED);
+      // Montar o arquivo final
+      const blob = new Blob(chunksRef.current, { type: fileMeta?.type });
+      const url = URL.createObjectURL(blob);
+      setDownloadUrl(url);
+    }
   };
 
-  // Render Helper: File Size
   const formatBytes = (bytes: number) => {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -131,7 +215,7 @@ function App() {
   return (
     <div className="min-h-screen bg-black text-white selection:bg-cyan-500 selection:text-black font-sans relative overflow-hidden">
       
-      {/* Dynamic Background */}
+      {/* Background */}
       <div className="absolute top-0 left-0 w-full h-full overflow-hidden -z-10 pointer-events-none">
           <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-blue-900/20 rounded-full blur-[120px] animate-pulse-slow"></div>
           <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-cyan-900/20 rounded-full blur-[120px] animate-pulse-slow" style={{animationDelay: '1s'}}></div>
@@ -148,11 +232,6 @@ function App() {
           </div>
           <h1 className="text-xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-400">AirBridge</h1>
         </div>
-        {sessionName && (
-             <div className="px-3 py-1 rounded-full bg-white/5 border border-white/10 text-xs font-mono text-cyan-400">
-                ID: {sessionName}
-             </div>
-        )}
       </header>
 
       {/* Main Content */}
@@ -163,10 +242,10 @@ function App() {
           <div className="flex flex-col gap-6 w-full animate-fade-in-up">
             <div className="text-center mb-8">
               <h2 className="text-4xl md:text-6xl font-extrabold mb-4 bg-clip-text text-transparent bg-gradient-to-br from-white via-cyan-200 to-blue-500">
-                Compartilhe na<br/>velocidade da luz.
+                P2P Ultra Rápido.
               </h2>
               <p className="text-gray-400 text-lg">
-                Transferência P2P criptografada. Funciona em iOS, Android e Desktop.
+                Transferência direta de dispositivo para dispositivo. Sem nuvem, sem limites.
               </p>
             </div>
 
@@ -175,20 +254,18 @@ function App() {
                     onClick={() => switchMode(AppMode.SENDER)}
                     className="group relative overflow-hidden p-8 rounded-3xl bg-slate-900/50 border border-white/10 hover:border-cyan-500/50 transition-all cursor-pointer hover:bg-slate-800/50"
                 >
-                    <div className="absolute inset-0 bg-gradient-to-br from-cyan-500/10 to-transparent opacity-0 group-hover:opacity-100 transition duration-500"></div>
                     <SendIcon className="w-12 h-12 text-cyan-400 mb-4 group-hover:scale-110 transition duration-300" />
                     <h3 className="text-2xl font-bold text-white mb-2">Enviar</h3>
-                    <p className="text-gray-400 text-sm">Transferir fotos, vídeos ou documentos.</p>
+                    <p className="text-gray-400 text-sm">Quero enviar um arquivo para outro dispositivo.</p>
                 </div>
 
                 <div 
-                    onClick={startReceiver}
+                    onClick={() => switchMode(AppMode.RECEIVER)}
                     className="group relative overflow-hidden p-8 rounded-3xl bg-slate-900/50 border border-white/10 hover:border-purple-500/50 transition-all cursor-pointer hover:bg-slate-800/50"
                 >
-                    <div className="absolute inset-0 bg-gradient-to-br from-purple-500/10 to-transparent opacity-0 group-hover:opacity-100 transition duration-500"></div>
                     <DownloadIcon className="w-12 h-12 text-purple-400 mb-4 group-hover:scale-110 transition duration-300" />
                     <h3 className="text-2xl font-bold text-white mb-2">Receber</h3>
-                    <p className="text-gray-400 text-sm">Tornar-se visível para dispositivos próximos.</p>
+                    <p className="text-gray-400 text-sm">Quero receber um arquivo neste dispositivo.</p>
                 </div>
             </div>
           </div>
@@ -196,122 +273,106 @@ function App() {
 
         {/* SENDER MODE */}
         {mode === AppMode.SENDER && (
-          <div className="w-full flex flex-col items-center">
+          <div className="w-full flex flex-col items-center animate-fade-in-up">
             
             {status === TransferStatus.IDLE && (
-               <div className="w-full">
-                  <label className="flex flex-col items-center justify-center w-full h-80 border-2 border-dashed border-gray-600 rounded-3xl bg-slate-900/30 hover:bg-slate-900/50 hover:border-cyan-500/50 transition cursor-pointer group">
+              <>
+                {!selectedFile ? (
+                   <label className="flex flex-col items-center justify-center w-full h-64 border-2 border-dashed border-gray-600 rounded-3xl bg-slate-900/30 hover:bg-slate-900/50 hover:border-cyan-500/50 transition cursor-pointer group mb-6">
                       <div className="flex flex-col items-center justify-center pt-5 pb-6">
-                          <div className="p-4 rounded-full bg-slate-800 mb-4 group-hover:scale-110 transition">
-                            <FileIcon className="w-8 h-8 text-cyan-400" />
-                          </div>
-                          <p className="mb-2 text-xl text-gray-300 font-semibold">Toque para escolher</p>
-                          <p className="text-sm text-gray-500">ou arraste seus arquivos aqui</p>
+                          <FileIcon className="w-10 h-10 text-cyan-400 mb-4 group-hover:scale-110 transition" />
+                          <p className="mb-2 text-xl text-gray-300 font-semibold">Escolher Arquivo</p>
                       </div>
-                      <input type="file" className="hidden" onChange={handleFileSelect} />
+                      <input type="file" className="hidden" onChange={(e) => e.target.files && setSelectedFile(e.target.files[0])} />
                   </label>
-               </div>
+                ) : (
+                  <div className="w-full bg-slate-800 p-6 rounded-2xl mb-6 flex items-center justify-between border border-white/10">
+                    <div className="flex items-center gap-4 overflow-hidden">
+                       <FileIcon className="w-8 h-8 text-cyan-400 flex-shrink-0" />
+                       <div className="overflow-hidden">
+                          <p className="font-bold truncate">{selectedFile.name}</p>
+                          <p className="text-xs text-gray-400">{formatBytes(selectedFile.size)}</p>
+                       </div>
+                    </div>
+                    <button onClick={() => setSelectedFile(null)} className="p-2 hover:bg-white/10 rounded-full">
+                       <XIcon className="w-5 h-5" />
+                    </button>
+                  </div>
+                )}
+
+                {selectedFile && (
+                  <div className="w-full max-w-sm bg-slate-900 p-6 rounded-2xl border border-white/10 shadow-xl">
+                      <p className="mb-2 text-sm text-gray-400">Insira o ID do Recebedor:</p>
+                      <div className="flex gap-2">
+                        <input 
+                          type="text" 
+                          maxLength={6}
+                          placeholder="Ex: A1B2C3"
+                          className="flex-1 bg-black/50 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-cyan-500 font-mono text-center uppercase tracking-widest text-lg"
+                          value={targetId}
+                          onChange={(e) => setTargetId(e.target.value.toUpperCase())}
+                        />
+                        <Button onClick={connectToReceiver} disabled={targetId.length < 6}>
+                          Enviar
+                        </Button>
+                      </div>
+                      <p className="text-xs text-gray-500 mt-4 text-center">Peça para a outra pessoa clicar em "Receber" e te informar o código.</p>
+                  </div>
+                )}
+              </>
             )}
 
-            {(status === TransferStatus.SCANNING || status === TransferStatus.CONNECTING) && (
-                <div className="w-full text-center">
-                    <RadarScan />
-                    
-                    {fileMeta && (
-                        <div className="mb-8 p-4 rounded-2xl bg-white/5 border border-white/10 backdrop-blur-sm max-w-sm mx-auto flex items-center gap-4 text-left">
-                            <div className="w-12 h-12 rounded-lg bg-gray-800 flex items-center justify-center overflow-hidden flex-shrink-0">
-                                {fileMeta.previewUrl ? (
-                                    <img src={fileMeta.previewUrl} alt="preview" className="w-full h-full object-cover" />
-                                ) : (
-                                    <FileIcon className="text-gray-400" />
-                                )}
-                            </div>
-                            <div className="overflow-hidden">
-                                <p className="font-semibold text-white truncate">{fileMeta.name}</p>
-                                <div className="flex items-center gap-2">
-                                  <span className="text-xs text-gray-400 bg-gray-800 px-2 py-0.5 rounded">{formatBytes(fileMeta.size)}</span>
-                                  {fileMeta.aiSummary && (
-                                    <span className="text-[10px] text-cyan-300 border border-cyan-900 px-2 py-0.5 rounded">{fileMeta.aiSummary}</span>
-                                  )}
-                                </div>
-                            </div>
-                        </div>
-                    )}
-
-                    <h3 className="text-gray-400 mb-6 uppercase text-xs tracking-widest font-semibold">Dispositivos Próximos</h3>
-                    
-                    <div className="space-y-3">
-                        {peers.length === 0 ? (
-                            <div className="h-20 flex items-center justify-center text-gray-600">Procurando...</div>
-                        ) : (
-                            peers.map(peer => (
-                                <button
-                                    key={peer.id}
-                                    onClick={() => connectToPeer(peer)}
-                                    disabled={peer.status === 'busy' || status === TransferStatus.CONNECTING}
-                                    className="w-full p-4 rounded-xl bg-slate-800 border border-slate-700 hover:border-cyan-500 flex items-center justify-between group transition disabled:opacity-50 disabled:cursor-not-allowed"
-                                >
-                                    <div className="flex items-center gap-4">
-                                        <div className="p-3 bg-slate-700 rounded-full text-cyan-400 group-hover:bg-cyan-900/30 transition">
-                                            {peer.device === 'mobile' ? <SmartphoneIcon /> : <LaptopIcon />}
-                                        </div>
-                                        <div className="text-left">
-                                            <p className="font-bold text-white">{peer.name}</p>
-                                            <p className="text-xs text-gray-400 capitalize">{peer.status}</p>
-                                        </div>
-                                    </div>
-                                    {status === TransferStatus.CONNECTING && connectedPeer?.id === peer.id && (
-                                        <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                                    )}
-                                </button>
-                            ))
-                        )}
-                    </div>
-                </div>
+            {status === TransferStatus.CONNECTING && (
+               <div className="text-center">
+                  <RadarScan />
+                  <p className="mt-4 text-cyan-400 font-medium">Conectando a {targetId}...</p>
+               </div>
             )}
           </div>
         )}
 
         {/* RECEIVER MODE */}
-        {mode === AppMode.RECEIVER && status !== TransferStatus.TRANSFERRING && status !== TransferStatus.COMPLETED && (
-             <div className="w-full text-center">
-                {status === TransferStatus.SCANNING ? (
-                     <>
-                        <RadarScan />
-                        <p className="text-gray-400 mt-4">Visível como <span className="text-white font-bold">{sessionName}</span></p>
-                        <p className="text-sm text-gray-600 mt-2">Mantenha esta tela aberta.</p>
-                     </>
-                ) : status === TransferStatus.CONNECTING && connectedPeer && fileMeta ? (
-                    <div className="animate-fade-in-up bg-slate-900 border border-cyan-500/30 p-8 rounded-3xl w-full max-w-sm mx-auto shadow-2xl shadow-cyan-900/20">
-                         <div className="w-20 h-20 bg-slate-800 rounded-full mx-auto mb-6 flex items-center justify-center animate-bounce">
-                             <DownloadIcon className="w-10 h-10 text-cyan-400" />
-                         </div>
-                         <h3 className="text-2xl font-bold text-white mb-2">{connectedPeer.name}</h3>
-                         <p className="text-gray-400 mb-6">quer enviar um arquivo</p>
-                         
-                         <div className="bg-black/30 p-4 rounded-xl mb-6 text-left border border-white/5">
-                            <p className="text-white font-medium truncate">{fileMeta.name}</p>
-                            <p className="text-sm text-gray-500 mt-1">{formatBytes(fileMeta.size)} • {fileMeta.aiSummary}</p>
-                         </div>
+        {mode === AppMode.RECEIVER && (
+          <div className="w-full flex flex-col items-center text-center animate-fade-in-up">
+             
+             {(status === TransferStatus.WAITING_FOR_ID || status === TransferStatus.WAITING_FOR_CONNECTION) && (
+                <div className="bg-slate-900 p-8 rounded-3xl border border-cyan-500/30 shadow-[0_0_30px_rgba(8,145,178,0.2)]">
+                   <p className="text-gray-400 mb-2">Seu Código de Recebimento</p>
+                   {myPeerId ? (
+                     <div className="text-5xl font-mono font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-500 tracking-wider mb-8">
+                       {myPeerId}
+                     </div>
+                   ) : (
+                     <div className="h-12 w-32 bg-slate-800 rounded animate-pulse mx-auto mb-8"></div>
+                   )}
+                   
+                   <div className="flex justify-center mb-4">
+                     <div className="relative">
+                       <div className="w-3 h-3 bg-green-500 rounded-full animate-ping absolute top-0 right-0"></div>
+                       <RadarIcon className="w-8 h-8 text-gray-500" />
+                     </div>
+                   </div>
+                   <p className="text-sm text-gray-500 animate-pulse">Aguardando conexão...</p>
+                </div>
+             )}
 
-                         <div className="grid grid-cols-2 gap-4">
-                             <Button variant="secondary" onClick={() => switchMode(AppMode.HOME)}>Recusar</Button>
-                             <Button onClick={acceptTransfer}>Aceitar</Button>
-                         </div>
-                    </div>
-                ) : null}
-             </div>
+             {status === TransferStatus.CONNECTING && (
+               <div className="text-center">
+                  <div className="w-16 h-16 border-4 border-cyan-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                  <p>Preparando recebimento...</p>
+               </div>
+             )}
+          </div>
         )}
 
-        {/* SHARED: TRANSFER STATUS */}
+        {/* SHARED: TRANSFER PROGRESS */}
         {(status === TransferStatus.TRANSFERRING || status === TransferStatus.COMPLETED) && (
              <div className="w-full max-w-sm text-center animate-fade-in-up">
                  <div className="relative w-48 h-48 mx-auto mb-8 flex items-center justify-center">
-                     {/* Circular Progress SVG */}
                      <svg className="w-full h-full -rotate-90" viewBox="0 0 100 100">
                          <circle className="text-slate-800" strokeWidth="8" stroke="currentColor" fill="transparent" r="40" cx="50" cy="50" />
                          <circle 
-                            className={`${status === TransferStatus.COMPLETED ? 'text-green-500' : 'text-cyan-500'} transition-all duration-300 ease-out`} 
+                            className={`${status === TransferStatus.COMPLETED ? 'text-green-500' : 'text-cyan-500'} transition-all duration-200 ease-linear`} 
                             strokeWidth="8" 
                             strokeDasharray={251.2} 
                             strokeDashoffset={251.2 - (251.2 * progress) / 100} 
@@ -333,24 +394,29 @@ function App() {
                  </div>
 
                  <h3 className="text-2xl font-bold mb-2">
-                     {status === TransferStatus.COMPLETED ? 'Transferência Concluída!' : 'Enviando Arquivo...'}
+                     {status === TransferStatus.COMPLETED ? 'Sucesso!' : (mode === AppMode.SENDER ? 'Enviando...' : 'Recebendo...')}
                  </h3>
-                 <p className="text-gray-400 mb-8">
-                    {status === TransferStatus.COMPLETED 
-                        ? `${fileMeta?.name} foi transferido com sucesso.` 
-                        : `Conectado a ${connectedPeer?.name} via WebRTC seguro.`
-                    }
-                 </p>
+                 
+                 {fileMeta && (
+                   <p className="text-gray-400 mb-8 truncate px-4">
+                      {fileMeta.name} ({formatBytes(fileMeta.size)})
+                   </p>
+                 )}
 
                  {status === TransferStatus.COMPLETED && (
                      <div className="flex flex-col gap-3">
-                        {mode === AppMode.RECEIVER && (
-                             <Button className="w-full" onClick={() => alert('Download simulated started')}>
-                                Salvar no Dispositivo
-                             </Button>
+                        {downloadUrl && mode === AppMode.RECEIVER && (
+                             <a 
+                               href={downloadUrl} 
+                               download={fileMeta?.name}
+                               className="flex items-center justify-center gap-2 w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-lg transition"
+                             >
+                                <DownloadIcon className="w-5 h-5" />
+                                Salvar Arquivo
+                             </a>
                         )}
                         <Button variant="secondary" onClick={() => switchMode(AppMode.HOME)}>
-                            Enviar outro arquivo
+                            Nova Transferência
                         </Button>
                      </div>
                  )}
